@@ -1,0 +1,7 @@
+/var/log/chronam/*.log {
+    rotate 2
+    daily
+    notifempty
+    delaycompress
+    create 0644 ndnp ndnp
+}

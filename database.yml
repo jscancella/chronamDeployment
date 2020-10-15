@@ -1,0 +1,60 @@
+- hosts: localhost
+  gather_facts: no
+  vars:
+      param_group_name: "chronam-mysql-utf8"
+      filesystem_size: 100 #minimum is 100
+  vars_files:
+      - variables.yml
+      - vault.yml
+  tasks:
+      # Create a database group which uses utf8mb4 for all character set-related settings
+      - name: create chronam mysql parameter group
+        rds_param_group:
+            state: present
+            name: "{{ param_group_name }}"
+            description: "MySQL 5.7 parameter group changing all character sets to utf8mb4"
+            engine: "mysql5.7"
+            region: "{{ chronam_aws_region }}"
+            params:
+                character_set_client: "utf8mb4"
+                character_set_connection: "utf8mb4"
+                character_set_database: "utf8mb4"
+                character_set_results: "utf8mb4"
+                character_set_server: "utf8mb4"
+                character_set_system: "utf8mb4"
+
+      - rds_instance_facts:
+            db_instance_identifier: "chronam-{{ env | lower }}"
+        register: chronam_db_facts
+
+      - name: Provision MySQL RDS
+        rds:
+            command: "create"
+            subnet: "{{ database_subnet_group }}"
+            vpc_security_groups: "{{ database_security_group }}"
+            db_engine: "MySQL"
+            engine_version: "5.7"
+            parameter_group: "{{ param_group_name }}"
+            db_name: "chronam"
+            username: "root"
+            password: "{{ root_database_password }}"
+            instance_name: "chronam-{{ env }}"
+            instance_type: "{{ rds_instance_type }}"
+            iops: "{{ filesystem_size * 10 }}"
+            region: "{{ chronam_aws_region }}"
+            zone: "{{ chronam_aws_zone }}"
+            size: "{{ filesystem_size }}"
+            wait: True
+            wait_timeout: 900
+        register: mysql_rds
+        when: chronam_db_facts.instances|length < 1
+
+      - rds_instance_facts:
+            db_instance_identifier: "chronam-{{ env | lower }}"
+        register: chronam_db_facts
+
+      - name: Populate the mysql_instances group
+        add_host:
+            hostname: "{{ item.endpoint.address }}"
+            groupname: mysql_instances
+        with_items: "{{ chronam_db_facts.instances }}"

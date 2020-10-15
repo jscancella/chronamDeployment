@@ -1,0 +1,367 @@
+- hosts: localhost
+  gather_facts: no
+  vars:
+      # Ubuntu 18.04 LTS hvm:ebs-ssd
+      aws_ami: "ami-0a313d6098716f372"
+      java_packages: "openjdk-8-jdk"
+  vars_files:
+      - variables.yml
+  tasks:
+      - name: Provision server for Solr
+        ec2:
+            instance_type: "{{ solr_instance_type }}"
+            termination_protection: "{{ aws_termination_protection }}"
+            image: "{{ aws_ami }}"
+            keypair: "{{ lookup('env','AWS_KEY_PAIR') }}"
+            instance_profile_name: "ManagedSystem"
+            region: "{{ chronam_aws_region }}"
+            zone: "{{ chronam_aws_zone }}"
+            wait: True
+            group: "{{ solr_security_group }}"
+            vpc_subnet_id: "{{ aws_vpc_subnet_id }}"
+            exact_count: 1
+            count_tag:
+                Name: "Chronam Solr"
+                Environment: "{{ env }}"
+                Project: "chronam"
+                DeploymentCluster: "{{ deployment_cluster }}"
+            instance_tags:
+                Name: "Chronam Solr"
+                Environment: "{{ env }}"
+                Project: "chronam"
+                DeploymentCluster: "{{ deployment_cluster }}"
+                Service: Solr
+            ebs_optimized: true
+            volumes:
+                - device_name: "/dev/sda1"
+                  volume_type: "{{ ec2_storage_type }}"
+                  volume_size: "{{ ec2_filesystem_size }}"
+                  delete_on_termination: True
+            user_data: |
+                #!/bin/sh
+                # Ensure that /usr/bin/python exists for Ansible:
+                apt update -qy && apt-get install -qy python-minimal
+        register: solr_ec2
+
+      - name: create separate volume for solr index
+        ec2_vol:
+            region: "{{ chronam_aws_region }}"
+            instance: "{{ item.id }}"
+            volume_size: "{{ solr_data_size }}"
+            volume_type: "{{ ec2_cache_storage_type }}"
+            delete_on_termination: yes
+            tags:
+                Name: "Chronam Solr Index"
+                Environment: "{{ env }}"
+                Project: "chronam"
+                DeploymentCluster: "{{ deployment_cluster }}"
+                Service: Solr
+        register: solr_index_volume
+        with_items: "{{ solr_ec2.instances }}"
+
+      - name: Wait for ssh to come up
+        wait_for:
+            host: "{{ item.public_dns_name }}"
+            delay: 60
+            port: 22
+            state: started
+            search_regex: OpenSSH
+        with_items: "{{ solr_ec2.instances }}"
+
+      - name: Ensure that SSH host keys are registered before we attempt to connect
+        delegate_to: localhost
+        shell: ssh-keyscan {{ item.public_ip }} {{ item.public_dns_name }} >> ~/.ssh/known_hosts
+        with_items: "{{ solr_ec2.instances }}"
+
+- name: Update EC2 Inventory
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+      - variables.yml
+  tasks:
+      - name: Retrieve Solr servers from EC2 Inventory
+        ec2_instance_facts:
+            filters:
+                "instance-state-name": "running"
+                "tag:Name": "Chronam Solr"
+                "tag:Environment": "{{ env }}"
+                "tag:DeploymentCluster": "{{ deployment_cluster }}"
+                "tag:Project": chronam
+        register: ec2_solr_inventory
+
+      - name: Add host to Solr instances group
+        add_host:
+            hostname: "{{ item.public_dns_name }}"
+            groupname: solr_instances
+        with_items: "{{ ec2_solr_inventory.instances }}"
+
+      - name: Add host to project group
+        add_host:
+            hostname: "{{ item.public_dns_name }}"
+            groupname: tag_Project_chronam
+        with_items: "{{ ec2_solr_inventory.instances }}"
+
+      - name: Add new instance to deployment cluster group
+        add_host:
+            hostname: "{{ item.public_dns_name }}"
+            groupname: "tag_DeploymentCluster_{{ deployment_cluster }}"
+        with_items: "{{ ec2_solr_inventory.instances }}"
+
+      - name: Updating solr_private_ips group
+        add_host:
+            hostname: "{{ item.private_ip_address }}"
+            groupname: solr_private_ips
+        with_items: "{{ ec2_solr_inventory.instances }}"
+
+- name: Configure Solr storage
+  hosts: "solr_instances:&tag_DeploymentCluster_{{ deployment_cluster }}"
+  user: ubuntu
+  become: yes
+  gather_facts: yes
+  tasks:
+      - name: Wait for the system to complete booting
+        wait_for:
+            path: /sbin/mkfs
+            state: present
+
+      - name: format ebs volume to ext4
+        # filesystem erroneously reports that NVMe devices do not exist and
+        # requires us to pass flags for labels and reserved blocks anyway so
+        # there's almost no value in using it.
+        #
+        # IMPORTANT: the NVMe device numbers are NOT stable across reboots and
+        # Ansible offers no way to describe block devices and match them up! We
+        # could call the EC2 APIs, scrape the version ID out of the response,
+        # reformat it to match the format returned by the ec2_vol module
+        # (there's an extra hyphen vol-NUMBER and volNUMBER), and use udevadm to
+        # look it up but since we don't need to do anything with it beyond the
+        # first boot we can cheat and rely on the newly-attached volume
+        # consistently getting the *second* NVMe device ID and make sure that we
+        # use labels in the actual mount declaration so it doesn't matter if the
+        # devices change randomly on subsequent reboots.
+        shell: mountpoint -q /opt/solr || mkfs -t ext4 -L solr -m0 /dev/nvme1n1
+
+      - name: mount solr index as separate partition
+        mount:
+            name: /opt/solr
+            src: LABEL=solr
+            fstype: ext4
+            state: mounted
+
+- name: Install Solr
+  hosts: "solr_instances:&tag_DeploymentCluster_{{ deployment_cluster }}"
+  user: ubuntu
+  become: yes
+  gather_facts: yes
+  vars:
+      solr_xms: "2G"
+      solr_xmx: "40G"
+      solr_port: "8983"
+  vars_files:
+      - variables.yml
+  pre_tasks:
+      - name: Update apt packages otherwise Java role sometimes fails
+        apt:
+            update_cache: yes
+            cache_valid_time: 86400 #One day
+  roles:
+      - geerlingguy.java
+  # can't use this role since it installs it in cloud mode which is incompatible with current chronam
+  #    - geerlingguy.solr
+  tasks:
+      - name: "install Ubuntu user's authorized_keys file"
+        copy:
+            dest: /home/ubuntu/.ssh/authorized_keys
+            src: files/ubuntu-authorized-keys
+            mode: 0700
+
+      - name: install dependencies from APT
+        apt:
+            name:
+                - jetty9
+                - python3-pip
+
+      - name: make solr directory
+        file:
+            path: /opt/solr
+            state: directory
+
+      - name: make Solr script directory
+        file:
+            path: /opt/solr/bin
+            state: directory
+            mode: 0755
+
+      - name: make Solr download cache directory
+        file:
+            path: /var/cache/solr-install
+            state: directory
+            mode: 0700
+
+      - name: Download Solr release tarball
+        get_url:
+            url: https://archive.apache.org/dist/lucene/solr/4.10.4/solr-4.10.4.tgz
+            dest: /var/cache/solr-install/solr-4.10.4.tgz
+            checksum: sha256:ac3543880f1b591bcaa962d7508b528d7b42e2b5548386197940b704629ae851
+
+      - name: Expand Solr
+        # Unarchive tries to unpack .tar.gz using unzip and since we have to
+        # pass custom flags anyway we're not getting the theoretical portability
+        # benefits anyway, plus this is much faster:
+        command: tar -C /opt/solr -xf /var/cache/solr-install/solr-4.10.4.tgz --strip-components=2 solr-4.10.4/example
+
+      - name: install the chronam solr schema
+        get_url:
+            url: "https://raw.githubusercontent.com/LibraryOfCongress/chronam/{{ github_version }}/solr/conf/schema.xml"
+            dest: "/opt/solr/solr/collection1/conf/schema.xml"
+            force: True
+
+      - name: make directory for extra analyzers
+        file:
+            path: /opt/solr/contrib
+            state: directory
+            recurse: True
+
+      - name: install Polish analyzer
+        get_url:
+            url: "http://central.maven.org/maven2/org/apache/lucene/lucene-analyzers-stempel/4.10.4/lucene-analyzers-stempel-4.10.4.jar"
+            dest: "/opt/solr/contrib/lucene-analyzers-stempel-4.10.4.jar"
+            checksum: sha256:6bfa88feccfe3ea39fc2d36d78e8fa65cb8c57a2764383913b6f428937495b7b
+
+      - name: install Polish stopwords
+        get_url:
+            url: "https://raw.githubusercontent.com/apache/lucene-solr/master/lucene/analysis/stempel/src/resources/org/apache/lucene/analysis/pl/stopwords.txt"
+            dest: "/opt/solr/solr/collection1/conf/lang/stopwords_pl.txt"
+            checksum: sha256:34e6b36ce36a2721ef3b5eda3bc3ad7166d323b9f89a4856241c65708b14ecc5
+
+      - name: install the chronam solr config
+        get_url:
+            url: "https://raw.githubusercontent.com/LibraryOfCongress/chronam/{{ github_version }}/solr/conf/solrconfig.xml"
+            dest: "/opt/solr/solr/collection1/conf/solrconfig.xml"
+            force: True
+
+      - name: create the solr user
+        user:
+            home: /opt/solr
+            shell: /bin/false
+            name: solr
+            uid: 6000 # FIXME: remove this and replace it with system: yes
+
+      - name: Create Solr log directory
+        file:
+            name: "/var/log/solr"
+            owner: solr
+            group: solr
+            mode: 0755
+            state: directory
+
+      - name: Create cronjob to remove old Solr log files
+        cron:
+            job: find /var/log/solr/ -type f -mtime +7 -delete
+            name: "Purge old Solr logs"
+            special_time: daily
+            user: solr
+
+      - name: remove unusable Jetty SysV init script
+        # The Jetty8 SysV init script is very poorly designed and Jetty will
+        # crash on startup for all but the most basic customiations. As usual,
+        # the best answer is switching to a few lines of simple systemd rather than
+        # debugging thousands of lines of poorly-tested shell soup.
+        file:
+            path: /etc/init.d/jetty9
+            state: absent
+
+      - name: Install Jetty systemd serice
+        copy:
+            dest: /etc/systemd/system/jetty9.service
+            src: files/jetty9.service
+            mode: 0644
+
+      - name: enable Jetty service
+        systemd:
+            daemon_reload: yes
+            enabled: yes
+            name: jetty9
+
+      - name: Install Solr watchdog script
+        copy:
+            dest: /opt/solr/bin/solr-watchdog
+            src: files/solr-watchdog
+            mode: 0700
+
+      - name: Grant Solr user permission to restart jetty9
+        lineinfile:
+            create: true
+            path: /etc/sudoers.d/solr-can-restart-jetty
+            line: "solr ALL = NOPASSWD:/bin/systemctl restart jetty9"
+
+      - name: Create cronjob to run Solr watchdog
+        cron:
+            job: /opt/solr/bin/solr-watchdog
+            name: "Check Solr health"
+            user: solr
+
+      - name: Copy cronjob script for solr index backup
+        copy:
+            dest: /opt/solr/bin/backup_solr_index.sh
+            src: scripts/backup_solr_index.sh
+            mode: 0700
+
+      - name: Install aws command line tool
+        pip:
+            name: awscli
+            extra_args: --upgrade
+
+      - name: Create .aws config folder
+        file:
+            name: "/opt/solr/.aws"
+            owner: solr
+            state: directory
+
+      - name: Configure aws command line tool default region
+        template:
+            src: "templates/config.j2"
+            dest: "/opt/solr/.aws/config"
+            owner: solr
+            mode: 0640
+
+      - name: set the correct permissions for solr
+        file:
+            owner: solr
+            path: /opt/solr
+            recurse: True
+
+      - name: Set correct Solr log path
+        lineinfile:
+            path: /opt/solr/resources/log4j.properties
+            line: "solr.log=/var/log/solr/"
+            regexp: "^solr.log=.*"
+
+      - name: Adjust Solr's default log level
+        lineinfile:
+            path: /opt/solr/resources/log4j.properties
+            line: "log4j.rootLogger=WARN, file, CONSOLE"
+            regexp: '^log4j\.rootLogger=.*'
+
+      # FIXME: figure out when this is safe to execute – perhaps when the register variables above are flagged as having created the instance during the same run?
+      #    - name: Copy the latest backup
+      #      command: aws s3 sync s3://chronam-solr-backups/index/ /opt/solr/solr/collection1/data/index
+      #      become_user: "solr"
+      #      when: env == "Production"
+
+      - name: Add server role and environment to bash prompt
+        lineinfile:
+            create: True
+            line: 'export PS1="[ChronAm Solr {{ env }} {{ deployment_cluster }} ($(lsb_release --description --short))] $PS1"'
+            path: "{{ item }}"
+            mode: 0644
+        with_items:
+            - "/opt/solr/.bashrc"
+            - "/home/ubuntu/.bashrc"
+
+      - name: restart Jetty
+        systemd:
+            daemon_reload: yes
+            enabled: yes
+            name: jetty9
+            state: restarted

@@ -1,0 +1,76 @@
+- hosts: localhost
+  gather_facts: false
+  tasks:
+      - fail:
+            msg: "The environmental variable AWS_KEY_PAIR must be defined"
+        when: lookup('env', 'AWS_KEY_PAIR') == ''
+      - fail:
+            msg: "The Ansible variable 'env' must be defined"
+        when: env is undefined
+
+      - fail:
+            msg: "The Ansible variable 'deployment_cluster' must be either “blue” or “green”"
+        when: (deployment_cluster is undefined) or (deployment_cluster != 'blue' and deployment_cluster != 'green')
+
+      - name: set variables
+        set_fact:
+            rds_instance_type: "db.m4.xlarge"
+            solr_data_size: 1500
+            solr_instance_type: "m5.xlarge"
+            django_instance_type: "m4.2xlarge"
+            varnish_instance_type: "r4.2xlarge"
+            varnish_cache_size: 800
+            ec2_filesystem_size: 50
+            ec2_storage_type: "gp2"
+            ec2_cache_storage_type: "gp2"
+            aws_termination_protection: False
+
+      - name: set variables for Development
+        set_fact:
+            env_short_name: dev
+        when: env == "Development"
+
+      - name: set variables for Testing
+        set_fact:
+            env_short_name: test
+        when: env == "Testing"
+
+      - name: set variables for Staging
+        set_fact:
+            env_short_name: stage
+        when: env == "Staging"
+
+      - name: set variables for Production
+        set_fact:
+            env_short_name: prod
+            aws_termination_protection: True
+        when: env == "Production"
+
+      - name: get vpc info
+        ec2_vpc_net_facts:
+            filters:
+                "tag:Name": "chronam-{{ env_short_name }}-vpc"
+        register: vpc_info
+
+      - name: get database security group info
+        ec2_group_facts:
+            filters:
+                vpc-id: "{{ vpc_info.vpcs[0].vpc_id }}"
+                group-name: chronam-database-security-group*
+        register: db_security_groups
+
+      - name: get us-east-1b subnet info
+        ec2_vpc_subnet_facts:
+            filters:
+                "tag:Name": "chronam-{{ env_short_name }}-us-east-1b"
+        register: vpc_subnet_info
+
+      - name: set {{ env }} extra facts
+        set_fact:
+            database_security_group: "{{ db_security_groups.security_groups[0].group_id }}"
+            aws_vpc_subnet_id: "{{ vpc_subnet_info.subnets[0].subnet_id }}"
+            database_subnet_group: "chronam-{{ env_short_name }}-vpc"
+            solr_security_group: "chronam-index-security-group-{{ env_short_name }}"
+            varnish_security_group: "chronam-cache-security-group-{{ env_short_name }}"
+            django_security_group: "chronam-web-application-security-group-{{ env_short_name }}"
+            aws_vpc_id: "{{ vpc_info.vpcs[0].vpc_id }}"

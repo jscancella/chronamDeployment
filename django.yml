@@ -1,0 +1,846 @@
+- name: Provision web app servers
+  hosts: localhost
+  gather_facts: false
+  vars:
+      # Ubuntu 18.04 LTS hvm:ebs-ssd
+      aws_ami: "ami-0a313d6098716f372"
+  vars_files:
+      - variables.yml
+  tasks:
+      - name: Provision servers for django
+        ec2:
+            instance_type: "{{ django_instance_type }}"
+            termination_protection: "{{ aws_termination_protection }}"
+            image: "{{ aws_ami }}"
+            region: "{{ chronam_aws_region }}"
+            zone: "{{ chronam_aws_zone }}"
+            keypair: "{{ lookup('env','AWS_KEY_PAIR') }}"
+            exact_count: "{{ 2 if (env == 'Production') else 1 }}"
+            instance_profile_name: "ManagedSystem"
+            count_tag:
+                Name: "Chronam Web App"
+                Environment: "{{ env }}"
+                Project: chronam
+                DeploymentCluster: "{{ deployment_cluster }}"
+            wait: True
+            group: "{{ django_security_group }}"
+            vpc_subnet_id: "{{ aws_vpc_subnet_id }}"
+            instance_tags:
+                Name: "Chronam Web App"
+                Environment: "{{ env }}"
+                Project: "chronam"
+                DeploymentCluster: "{{ deployment_cluster }}"
+                Service: "Django"
+            volumes:
+                - device_name: "/dev/sda1"
+                  volume_type: "{{ ec2_storage_type }}"
+                  volume_size: "{{ ec2_filesystem_size }}"
+                  delete_on_termination: True
+            user_data: |
+                #!/bin/sh
+                # Ensure that /usr/bin/python exists for Ansible:
+                export DEBIAN_FRONTEND="noninteractive"
+                apt-get update -qy && apt-get install -qy python-minimal
+        register: django_ec2
+
+      - name: create separate volume for s3 file caching
+        ec2_vol:
+            region: "{{ chronam_aws_region }}"
+            device_name: /dev/xvdf
+            instance: "{{ item.id }}"
+            volume_size: "{{ 2048 if (env == 'Production') else 50 }}"
+            volume_type: "{{ ec2_cache_storage_type }}"
+            delete_on_termination: yes
+            tags:
+                Name: "Chronam Django S3 Cache"
+                Environment: "{{ env }}"
+                Project: "chronam"
+                DeploymentCluster: "{{ deployment_cluster }}"
+                Service: "Django"
+        with_items: "{{ django_ec2.instances }}"
+
+      - name: Wait for ssh to come up
+        wait_for:
+            host: "{{ item.public_dns_name }}"
+            delay: 60
+            timeout: 600
+            port: 22
+            state: started
+        with_items: "{{ django_ec2.instances }}"
+
+      - name: Ensure that SSH host keys are registered before we attempt to connect
+        delegate_to: localhost
+        shell: ssh-keyscan {{ item.public_ip }} {{ item.public_dns_name }} >> ~/.ssh/known_hosts
+        with_items: "{{ django_ec2.instances }}"
+
+- name: Update EC2 Inventory
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+      - variables.yml
+  tasks:
+      - name: Retrieve web servers from EC2 Inventory
+        ec2_instance_facts:
+            filters:
+                "instance-state-name": "running"
+                "tag:Name": "Chronam Web App"
+                "tag:Environment": "{{ env }}"
+                "tag:DeploymentCluster": "{{ deployment_cluster }}"
+                "tag:Project": chronam
+        register: ec2_web_app_inventory
+
+      - name: Add new instance to Django host group
+        add_host:
+            hostname: "{{ item.public_dns_name }}"
+            groupname: django_instances
+        with_items: "{{ ec2_web_app_inventory.instances }}"
+
+      - name: Add new instance to project group
+        add_host:
+            hostname: "{{ item.public_dns_name }}"
+            groupname: tag_Project_chronam
+        with_items: "{{ ec2_web_app_inventory.instances }}"
+
+      - name: Add new instance to deployment cluster group
+        add_host:
+            hostname: "{{ item.public_dns_name }}"
+            groupname: "tag_DeploymentCluster_{{ deployment_cluster }}"
+        with_items: "{{ ec2_web_app_inventory.instances }}"
+
+- name: Perform system-level configuration
+  hosts: "django_instances:&tag_DeploymentCluster_{{ deployment_cluster }}"
+  become: yes
+  gather_facts: yes
+  vars:
+      umask: "umask=0022"
+  vars_files:
+      - variables.yml
+      - vault.yml
+  tasks:
+      - name: Wait for the cloud-init process to complete
+        wait_for:
+            path: /var/lib/cloud/instance/boot-finished
+            state: present
+
+      - name: Wait for any possibly running unattended upgrade to finish
+        raw: systemd-run --property="After=apt-daily.service apt-daily-upgrade.service" --wait /bin/true
+
+      - name: Upgrade all packages to the latest version
+        apt:
+            name: "*"
+            state: latest
+            update_cache: yes
+            cache_valid_time: 86400
+            force_apt_get: yes
+            autoremove: yes
+            autoclean: yes
+
+      - name: set mounts to read only if environment isn't Production
+        set_fact:
+            umask: "umask=0002"
+        when: env != "Production"
+
+      - name: format ebs volume to ext4
+        filesystem:
+            dev: /dev/xvdf
+            fstype: ext4
+
+      - name: remove all reserved blocks from S3 cache partition
+        command: tune2fs -m 0 /dev/xvdf
+
+      - name: mount /var/cache as separate partition
+        mount:
+            name: /var/cache
+            src: /dev/xvdf
+            fstype: ext4
+            state: mounted
+
+      - name: "install Ubuntu user's authorized_keys file"
+        copy:
+            dest: /home/ubuntu/.ssh/authorized_keys
+            src: files/ubuntu-authorized-keys
+            mode: 0700
+
+      - name: create chronam group
+        group:
+            name: "ndnp"
+            gid: 5000
+
+      - name: create chronam user
+        user:
+            name: "ndnp"
+            uid: 5000
+            comment: "chronam site user"
+            shell: /bin/bash
+            home: /home/ndnp
+            group: ndnp
+            groups:
+                - ndnp
+                - www-data
+                - users
+
+      - name: create ~/ndnp/.ssh directory
+        file:
+            path: /home/ndnp/.ssh
+            state: directory
+            mode: 0700
+            owner: ndnp
+            group: ndnp
+
+      - name: "install NDNP user's authorized_keys file"
+        copy:
+            dest: /home/ndnp/.ssh/authorized_keys
+            src: files/ndnp-authorized-keys
+            mode: 0640
+            owner: ndnp
+            group: ndnp
+
+      - name: create chronam directories
+        file:
+            path: "{{ item }}"
+            state: directory
+            mode: 0755
+            group: ndnp
+            owner: ndnp
+        with_items:
+            - /opt/chronam
+            - /srv/chronam
+            - /var/log/chronam
+            - /var/log/celery
+
+      - name: create chronam tmpfiles.d entry
+        lineinfile:
+            create: true
+            path: /etc/tmpfiles.d/chronam.conf
+            line: "d /run/chronam 0750 ndnp ndnp -"
+
+      - name: install prometheus exporter for apache
+        copy:
+            dest: /usr/local/bin/apache_exporter
+            src: files/apache_exporter
+            mode: 0755
+
+      - name: install dependencies
+        apt:
+            update_cache: true
+            cache_valid_time: 86400
+            name:
+                - python2.7-dev
+                - python-pip
+                - libmysqlclient-dev
+                - apache2
+                - apache2-utils
+                - libapache2-mod-wsgi
+                - libapache2-mod-xsendfile
+                - libxml2-dev
+                - libxslt-dev
+                - libjpeg-dev
+                - git-core
+                - graphicsmagick
+                - mysql-client
+                - python-mysqldb
+                - pkg-config
+                # These are required when the mysql_user and pip modules are run
+                # using the Ansible task running under python3 rather than
+                # python2, as used by the app:
+                - python3-mysqldb
+                - python3-pip
+
+      - name: create chronam user and set permissions
+        mysql_user:
+            login_host: "{{ groups['mysql_instances'][0] }}"
+            login_password: "{{ root_database_password }}"
+            login_user: "root"
+            name: "chronam"
+            password: "{{ database_password }}"
+            host: "%"
+            priv: "chronam.*:ALL"
+
+      - name: configure updatedb to ignore s3fs
+        lineinfile:
+            path: /etc/updatedb.conf
+            regexp: "^PRUNEFS="
+            line: 'PRUNEFS="NFS nfs nfs4 rpc_pipefs afs binfmt_misc proc smbfs autofs iso9660 ncpfs coda devpts ftpfs devfs mfs shfs sysfs cifs lustre tmpfs usbfs udf fuse.glusterfs fuse.sshfs curlftpfs ecryptfs fusesmb devtmpfs s3fs fuse fuse.s3fs"'
+
+      - name: configure updatedb to ignore local caches
+        lineinfile:
+            path: /etc/updatedb.conf
+            regexp: "^PRUNEPATHS="
+            line: 'PRUNEPATHS="/tmp /var/spool /media /home/.ecryptfs /var/cache /var/tmp"'
+
+      - stat:
+            path: /var/cache/s3fs-fuse-1.85.tar.gz
+            checksum_algorithm: sha256
+        register: s3fs_source
+
+      - block:
+            - name: Install s3fs dependencies
+              apt:
+                  update_cache: true
+                  name:
+                      - automake
+                      - build-essential
+                      - libcurl4-openssl-dev
+                      - libfuse-dev
+                      - libssl-dev
+                      - libtool
+                      - libxml2-dev
+                      - mime-support
+                      - pkg-config
+
+            - name: download s3fs source code
+              get_url:
+                  url: https://github.com/s3fs-fuse/s3fs-fuse/archive/v1.85.tar.gz
+                  dest: /var/cache/s3fs-fuse-1.85.tar.gz
+                  checksum: sha256:c4b48c0aba6565b9531c251d42a6a475a7e845909a3017b61d9c945b15cc008f
+
+            - name: unpack s3fs source code
+              unarchive:
+                  copy: no
+                  src: /var/cache/s3fs-fuse-1.85.tar.gz
+                  dest: /tmp
+
+            - name: Ensure that the older packaged S3FS is not installed
+              apt:
+                  name: s3fs
+                  state: absent
+
+            - name: install s3fs from source
+              script: scripts/install_s3fs.sh
+
+            - name: Remove temporary S3FS build path
+              file:
+                  state: absent
+                  path: /tmp/s3fs-fuse-1.85
+        when: not s3fs_source.stat.exists or s3fs_source.stat.checksum != 'c4b48c0aba6565b9531c251d42a6a475a7e845909a3017b61d9c945b15cc008f'
+
+      - name: configure s3fs
+        template:
+            src: "templates/passwd-s3fs.j2"
+            dest: "/etc/passwd-s3fs"
+            owner: root
+            group: root
+            mode: 0640
+
+      - name: mount s3 batches
+        mount:
+            state: mounted
+            path: /srv/chronam/batches/
+            src: s3fs#ndnp-batches
+            fstype: fuse
+            opts: "_netdev,{{ umask }},uid=5000,gid=5000,noexec,nosuid,nodev,noatime,allow_other,nonempty,ensure_diskfree=1024,retries=8,max_stat_cache_size=1500000,multireq_max=500,parallel_count=40,dbglevel=warning,use_cache=/var/cache/s3fs-chronam-data-batches"
+
+      - name: mount s3 word_coordinates
+        mount:
+            state: mounted
+            path: /srv/chronam/word_coordinates/
+            src: s3fs#chronam-data-word-coordinates
+            fstype: fuse
+            opts: "_netdev,{{ umask }},uid=5000,gid=5000,noexec,nosuid,nodev,noatime,allow_other,nonempty,ensure_diskfree=1024,retries=8,max_stat_cache_size=1500000,multireq_max=500,parallel_count=40,dbglevel=warning,use_cache=/var/cache/s3fs-chronam-data-word-coordinates"
+
+      - name: mount s3 OCR dumps
+        mount:
+            state: mounted
+            path: /srv/chronam/ocr
+            src: s3fs#chronam-ocr-dumps
+            fstype: fuse
+            opts: "_netdev,{{ umask }},uid=5000,gid=5000,noexec,nosuid,nodev,noatime,allow_other,nonempty,ensure_diskfree=1024,retries=8,max_stat_cache_size=500000,multireq_max=500,parallel_count=20,dbglevel=warning,use_cache=/var/cache/s3fs-chronam-ocr-dumps"
+
+      - name: install aware C headers
+        synchronize:
+            src: "files/aware-3-18-9/include/"
+            dest: "/usr/local/include/"
+
+      - name: install aware binary
+        copy:
+            src: "files/aware-3-18-9/j2k-3.18.9-linux-x86-64/lib/libawj2k.so.2.0.1"
+            dest: "/usr/local/lib/"
+
+      - name: create aware symbolic link
+        file:
+            state: link
+            src: "/usr/local/lib/libawj2k.so.2.0.1"
+            dest: "/usr/local/lib/libawj2k.so"
+
+      - name: add aware to ldconfig
+        lineinfile:
+            create: True
+            line: "/usr/local/lib"
+            path: "/etc/ld.so.conf.d/aware.so.conf"
+
+      - name: load ldconfig for aware
+        command: ldconfig /usr/local/lib/
+
+      - name: modify apache to run as chronam user
+        lineinfile:
+            path: /etc/apache2/envvars
+            regexp: "export APACHE_RUN_USER.*"
+            line: "export APACHE_RUN_USER=ndnp"
+
+      - name: Add server role and environment to bash prompt
+        lineinfile:
+            create: True
+            line: 'export PS1="[ChronAm Django {{ env }} {{ deployment_cluster }} ($(lsb_release --description --short))] $PS1"'
+            path: "{{ item }}"
+            mode: 0644
+        with_items:
+            - "/home/ndnp/.bashrc"
+            - "/home/ubuntu/.bashrc"
+
+      - name: Upgrade pip
+        pip:
+            name: pip
+            state: latest
+
+      - name: Install virtualenv
+        pip:
+            name: virtualenv
+
+      - name: Install Apache modules
+        apache2_module:
+            name: "{{ item }}"
+            state: present
+        with_items:
+            - expires
+            - rewrite
+            - cache
+            - cache_disk
+            - proxy
+            - proxy_http
+            - headers
+
+- name: Install application source code
+  hosts: "django_instances:&tag_DeploymentCluster_{{ deployment_cluster }}"
+  user: ndnp
+
+  vars_files:
+      - variables.yml
+
+  tasks:
+      - name: Clear existing git install
+        shell: test -d /opt/chronam/.git && (git clean -fd; git checkout --force {{ github_version }})
+        args:
+            chdir: /opt/chronam
+        ignore_errors: yes
+
+      - name: Git clone chronam code
+        git:
+            repo: "https://github.com/LibraryOfCongress/chronam.git"
+            dest: /opt/chronam
+            version: "{{ github_version }}"
+            force: yes
+        ignore_errors: yes
+        register: git_checkout
+
+- name: Install the ChronAm Apache configuration
+  hosts: "django_instances:&tag_DeploymentCluster_{{ deployment_cluster }}"
+  become: yes
+  gather_facts: yes
+
+  vars_files:
+      - variables.yml
+
+  tasks:
+      - name: Install Apache site config
+        copy:
+            src: /opt/chronam/conf/chronam-apache2_4.conf
+            dest: /etc/apache2/sites-available/chronam.conf
+            remote_src: yes
+
+      - name: Update Apache configuration until upstream is updated
+        replace:
+            path: /etc/apache2/sites-available/chronam.conf
+            regexp: /opt/chronam/data
+            replace: /srv/chronam
+            backup: no
+
+      - name: Enable S3 proxy for /data/
+        blockinfile:
+            marker: "# {mark} Ansible-managed S3 bulk downloads"
+            path: /etc/apache2/sites-available/chronam.conf
+            insertafter: ^\s*RewriteEngine
+            block: |
+                # Legacy URL patterns
+                RewriteRule "^/data/batches/batch_(.+)$" "/data/batches/$1" [redirect=301,last]
+                RewriteRule "^/batches/batch_(.+)$" "/batches/$1" [redirect=301,last]
+                # Serve downloads directly from S3 for maximum performance:
+                RewriteRule "^/data/batches/(.+[.][^/]+)$" "http://ndnp-batches.s3-website-us-east-1.amazonaws.com/$1" [proxy,last]
+                RewriteRule "^/data/ocr/(.+[.][^/]+)$" "http://chronam-ocr-dumps.s3-website-us-east-1.amazonaws.com/$1" [proxy,last]
+                RewriteRule "^/data/bib/(.+[.][^/]+)$" "http://chronam-bib.s3-website-us-east-1.amazonaws.com/$1" [proxy,last]
+                RewriteRule "^/data/word_coordinates/(.+[.][^/]+)$" "http://chronam-data-word-coordinates.s3-website-us-east-1.amazonaws.com/$1" [proxy,last]
+                # Serve index pages and all other requests from the S3-indexpage proxy:
+                RewriteRule "^/data/(.*)" "http://internal-chronam-data-318681474.us-east-1.elb.amazonaws.com/$1" [proxy,last]
+
+                <LocationMatch ".*\.jp2$">
+                    Header set Content-Type image/jp2 "expr=%{REQUEST_STATUS} == 200"
+                </LocationMatch>
+                <LocationMatch ".*\.pdf$">
+                    Header set Content-Type application/pdf "expr=%{REQUEST_STATUS} == 200"
+                </LocationMatch>
+                <LocationMatch ".*\.xml$">
+                    Header set Content-Type application/xml "expr=%{REQUEST_STATUS} == 200"
+                </LocationMatch>
+                <LocationMatch ".*\.txt$">
+                    Header set Content-Type text/plain "expr=%{REQUEST_STATUS} == 200"
+                </LocationMatch>
+
+      - name: Disable Apache server signatures on generated index pages
+        lineinfile:
+            path: /etc/apache2/sites-available/chronam.conf
+            line: "ServerSignature Off"
+
+      - name: Configure WSGI socket path
+        lineinfile:
+            path: /etc/apache2/sites-available/chronam.conf
+            line: "WSGISocketPrefix /run/chronam/"
+            regexp: "^WSGISocketPrefix.*"
+
+      - name: Enable Apache chronam site
+        file:
+            state: link
+            src: /etc/apache2/sites-available/chronam.conf
+            dest: /etc/apache2/sites-enabled/chronam.conf
+
+      - name: Disable default Apache site
+        file:
+            state: absent
+            path: /etc/apache2/sites-enabled/000-default.conf
+
+- name: Perform application-level configuration
+  hosts: "django_instances:&tag_DeploymentCluster_{{ deployment_cluster }}"
+  user: ndnp
+
+  vars_files:
+      - variables.yml
+      - vault.yml
+
+  tasks:
+      - name: Create chronam directories
+        file:
+            path: "{{ item }}"
+            state: directory
+        with_items:
+            - /opt/chronam/static
+            - /opt/chronam/.python-eggs
+            - /opt/chronam/temp
+
+      - name: Copy LC specific python dependencies
+        copy:
+            src: "files/{{ item }}"
+            dest: "/opt/chronam/{{ item }}"
+        with_items:
+            - django-lc-1.1.0.tar.gz
+
+      - name: create cache and bib directories
+        file:
+            path: "/srv/chronam/{{ item }}"
+            state: directory
+        with_items:
+            - cache
+            - bib
+
+      - name: Create settings.py file
+        copy:
+            src: /opt/chronam/settings_loc.py
+            dest: /opt/chronam/settings.py
+            remote_src: True
+
+      - name: Set the URL for the IIIF server
+        lineinfile:
+            path: /opt/chronam/settings.py
+            line: 'IIIF_IMAGE_BASE_URL = "https://chroniclingamerica.loc.gov/iiif/2/"'
+
+      - name: Set the storage paths
+        lineinfile:
+            path: /opt/chronam/settings.py
+            line: "{{ item }}"
+        with_items:
+            - STORAGE = '/srv/chronam/'
+            - BATCH_STORAGE = os.path.join(STORAGE, "batches")
+            - BIB_STORAGE = os.path.join(STORAGE, "bib")
+            - COORD_STORAGE = os.path.join(STORAGE, "word_coordinates")
+            - OCR_DUMP_STORAGE = os.path.join(STORAGE, "ocr")
+            - TEMP_STORAGE = "/tmp/"
+
+      - name: Set the URL for the Solr server
+        lineinfile:
+            path: /opt/chronam/settings.py
+            line: "SOLR = 'http://{{ groups['solr_private_ips'][0] }}:8080/solr'"
+
+      - name: Set chronam to be in production mode
+        lineinfile:
+            path: /opt/chronam/settings.py
+            line: "IS_PRODUCTION = True"
+
+      - name: Configure Django to trust the load-balancer's protocol headers
+        lineinfile:
+            path: /opt/chronam/settings.py
+            line: "SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')"
+
+      - name: Add environment to settings
+        lineinfile:
+            path: /opt/chronam/settings.py
+            line: "ENVIRONMENT = '{{ env }}'"
+
+      - name: Add release to settings
+        lineinfile:
+            path: /opt/chronam/settings.py
+            line: "RELEASE = '{{ git_checkout.after }}'"
+
+      - name: Set chronam to not be in debug mode
+        lineinfile:
+            path: /opt/chronam/settings.py
+            line: "DEBUG = False"
+
+      - name: Set a more lenient load-average limit
+        lineinfile:
+            path: /opt/chronam/settings.py
+            line: "TOO_BUSY_LOAD_AVERAGE = 64"
+
+      - name: Set log path in Django settings
+        lineinfile:
+            path: /opt/chronam/settings.py
+            line: "LOGGING['handlers']['file']['filename'] = '/var/log/chronam/chronam.log'"
+
+      - name: Log only errors to the console
+        lineinfile:
+            path: /opt/chronam/settings.py
+            line: "LOGGING['handlers']['console']['level'] = 'ERROR'"
+
+      - name: Set default log file level to warning
+        lineinfile:
+            path: /opt/chronam/settings.py
+            line: "LOGGING['handlers']['file']['level'] = 'WARN'"
+
+      - name: Reduce logging overhead
+        lineinfile:
+            path: /opt/chronam/settings.py
+            line: "LOGGING['root']['level'] = 'WARN'"
+
+      - name: Specify MySQL database and password in settings file
+        blockinfile:
+            path: /opt/chronam/settings.py
+            marker: "# {mark} Ansible-managed database settings"
+            block: |
+                DATABASES = {
+                    'default': {
+                        'ENGINE': 'django.db.backends.mysql',
+                        'NAME': 'chronam',
+                        'USER': 'chronam',
+                        'PASSWORD': '{{ database_password }}',
+                        'HOST': '{{ groups["mysql_instances"][0] }}',
+                        'CONN_MAX_AGE': 300,
+                    }
+                }
+
+      - name: Modify chronam to use AWS essay editor
+        lineinfile:
+            path: /opt/chronam/settings.py
+            line: "ESSAYS_FEED = 'http://essay-editor.chronam.cloud/feed/'" #TODO use API to get this
+
+      - name: Add Worldcat key to config file
+        lineinfile:
+            path: /opt/chronam/settings.py
+            regexp: "WORLDCAT_KEY.*"
+            line: "WORLDCAT_KEY = '{{ worldcat_api_key }}'"
+
+      - name: Insert Google Webmasters Verification
+        lineinfile:
+            path: /opt/chronam/loc/templates/home.html
+            insertbefore: "endblock extrahead"
+            line: '<meta name="google-site-verification" content="60lAEjrt1Mhjzxp92lROrlGsYFR9alVBZVncUMaus7Q" />'
+
+      - name: change ocr dump location for AWS
+        lineinfile:
+            path: /opt/chronam/settings.py
+            regexp: "OCR_DUMP_STORAGE.*"
+            line: 'OCR_DUMP_STORAGE = os.path.join(STORAGE, "ocr")'
+
+      - name: copy holdings
+        synchronize:
+            dest: /srv/chronam/bib/holdings/
+            src: files/chronam-holdings/
+        when: env == "Production"
+
+      - name: copy original titles
+        synchronize:
+            dest: /srv/chronam/bib/original_titles/
+            src: files/chronam-original-titles/
+        when: env == "Production"
+
+      - name: copy the initial chronam config script to remote
+        copy:
+            dest: /opt/chronam/django_initial_setup.sh
+            src: scripts/django_initial_setup.sh
+            mode: 0775
+
+      - name: Remove the existing virtualenv
+        file:
+            path: /opt/chronam/ENV
+            state: absent
+
+      - name: install the core dependencies
+        pip:
+            requirements: requirements.pip
+            chdir: /opt/chronam
+            virtualenv: /opt/chronam/ENV
+            virtualenv_python: /usr/bin/python2.7
+
+      - name: install django-lc
+        pip:
+            name: /opt/chronam/django-lc-1.1.0.tar.gz
+            chdir: /opt/chronam
+            virtualenv: /opt/chronam/ENV
+
+      - name: Install ChronAm path extension in the virtualenv
+        copy:
+            src: /opt/chronam/conf/chronam.pth
+            dest: /opt/chronam/ENV/lib/python2.7/site-packages/chronam.pth
+            remote_src: yes
+
+      - name: Add DJANGO_SETTINGS_MODULE to virtualenv
+        lineinfile:
+            path: "/opt/chronam/ENV/bin/activate"
+            line: "export DJANGO_SETTINGS_MODULE=chronam.settings"
+
+      - name: Install SDK for Sentry error collection
+        pip:
+            virtualenv: /opt/chronam/ENV
+            name: sentry-sdk
+
+      - name: Configure Sentry SDK
+        blockinfile:
+            path: /opt/chronam/settings.py
+            marker: "# {mark} Ansible-managed Sentry configuration"
+            block: |
+                import sentry_sdk
+                from sentry_sdk.integrations.django import DjangoIntegration
+
+                sentry_sdk.init(
+                    dsn='{{ SENTRY_DSN }}',
+                    release=RELEASE,
+                    environment=ENVIRONMENT,
+                    integrations=[DjangoIntegration()]
+                )
+
+      - name: Enable Sentry SDK for front-end error collection
+        lineinfile:
+            path: /opt/chronam/settings.py
+            line: "SENTRY_PUBLIC_DSN = '{{ SENTRY_PUBLIC_DSN }}'"
+        when: env != "Production"
+
+      - name: Run initial chronam config script
+        command: /opt/chronam/django_initial_setup.sh
+
+- name: Install systemd units and cron tasks
+  hosts: "django_instances:&tag_DeploymentCluster_{{ deployment_cluster }}"
+  become: yes
+  gather_facts: yes
+  vars:
+      umask: "umask=0022"
+  vars_files:
+      - variables.yml
+      - vault.yml
+  tasks:
+      - name: install Celery systemd unit
+        get_url:
+            url: "https://raw.githubusercontent.com/LibraryOfCongress/chronam/{{ github_version }}/conf/celeryd.service"
+            dest: "/etc/systemd/system/celeryd.service"
+            force: True
+            mode: 0644
+
+      - name: install CeleryBeat systemd unit
+        get_url:
+            url: "https://raw.githubusercontent.com/LibraryOfCongress/chronam/{{ github_version }}/conf/celerybeat.service"
+            dest: "/etc/systemd/system/celerybeat.service"
+            force: True
+            mode: 0644
+
+      - name: install Prometheus Apache exporter systemd exporter
+        copy:
+            dest: "/etc/systemd/system/apache_exporter.service"
+            src: "files/apache_exporter.service"
+            mode: 0644
+
+      - name: enable Celery service
+        systemd:
+            daemon_reload: yes
+            enabled: yes
+            name: celeryd
+            state: started
+
+      - name: enable celerybeat service
+        systemd:
+            daemon_reload: yes
+            enabled: yes
+            name: celerybeat
+            state: started
+
+      - name: enable Apache Exporter service
+        systemd:
+            daemon_reload: yes
+            enabled: yes
+            name: apache_exporter
+            state: started
+
+      - name: Copy cronjob script for checking S3 mounts
+        copy:
+            dest: /usr/local/sbin/check-chronam-s3fs-mounts
+            src: scripts/checkmounts.sh
+            owner: root
+            group: root
+            mode: 0755
+
+      - name: Create cronjob to check S3 mounts
+        cron:
+            job: flock --nonblock /run/s3fs-watchdog /usr/local/sbin/check-chronam-s3fs-mounts
+            name: "Check S3FS mounts"
+            minute: "*"
+            hour: "*"
+            day: "*"
+            month: "*"
+            weekday: "*"
+
+      - name: Create cronjob to prune s3fs caches
+        cron:
+            name: "Prune local S3FS cache"
+            special_time: hourly
+            job: find /var/cache/s3fs-chronam-* -type f -ctime +1 -delete
+
+      - name: Copy cronjob script for checking S3 mounts
+        copy:
+            dest: /usr/local/sbin/apache-watchdog
+            src: scripts/apache-watchdog
+            owner: root
+            group: root
+            mode: 0755
+
+      - name: Create cronjob to test Apache health-check and reboot if it doesn't recover
+        cron:
+            job: /usr/local/sbin/apache-watchdog
+            name: "Check Apache health"
+            minute: "*/1"
+            hour: "*"
+            day: "*"
+            month: "*"
+            weekday: "*"
+
+      - name: Create cronjob to prune Apache logs
+        cron:
+            name: "Prune local Apache logs"
+            special_time: daily
+            job: find /var/log/chronam/ /var/log/apache2/ -type f -ctime +30 -delete
+
+- name: Restart application services
+  hosts: "django_instances:&tag_DeploymentCluster_{{ deployment_cluster }}"
+  become: yes
+  tasks:
+      - name: restart services
+        systemd:
+            name: "{{ item }}"
+            state: restarted
+        with_items:
+            - apache2
+            - celeryd
+            - celerybeat
+            - apache_exporter

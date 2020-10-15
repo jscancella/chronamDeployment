@@ -1,0 +1,8 @@
+- import_playbook: gather_info.yml
+- import_playbook: database.yml
+- import_playbook: solr.yml
+- import_playbook: django.yml
+- import_playbook: varnish.yml
+- import_playbook: all_ubuntu.yml
+- import_playbook: cis_hardening.yml
+- import_playbook: itsg-scanning.yml

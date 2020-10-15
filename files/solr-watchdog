@@ -1,0 +1,15 @@
+#!/bin/sh
+
+set -eu
+
+# Test whether Solr is up several times to avoid race conditions when Solr is
+# starting up or very busy (i.e. rebuilding & optimizing the index)
+
+for _ in $(seq 1 30); do
+    curl -o /dev/null --silent --fail --show-error 'http://127.0.0.1:8080/solr/admin/ping' && exit 0
+    sleep 2
+done
+
+logger --stderr --tag solr-watchdog "Solr is unresponsive. Attempting to restart..."
+
+sudo systemctl restart jetty9

@@ -1,0 +1,13 @@
+#!/bin/bash
+
+set -eu
+
+cd "$(dirname "$(readlink -f "$0")")"
+
+install -d -o ndnp -g ndnp -m 755 /var/log/chronam
+
+install -o ndnp -g ndnp -m 644 chronam-logrotate /etc/logrotate.d/chronam
+
+if ! grep -q "/var/log/chronam/chronam.log" /opt/chronam/settings.py; then
+    echo 'LOGGING["handlers"]["file"]["filename"] = "/var/log/chronam/chronam.log"' | sudo -u ndnp tee -a /opt/chronam/settings.py
+fi

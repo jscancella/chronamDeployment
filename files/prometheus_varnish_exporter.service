@@ -1,0 +1,13 @@
+[Unit]
+Description=Prometheus Varnish Exporter
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=10s
+User=varnish
+Group=varnish
+ExecStart=/usr/bin/prometheus_varnish_exporter
+
+[Install]
+WantedBy=multi-user.target

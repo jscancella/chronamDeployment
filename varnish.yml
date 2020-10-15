@@ -1,0 +1,240 @@
+- hosts: localhost
+  gather_facts: no
+  vars:
+      # Ubuntu 18.04 LTS hvm:ebs-ssd
+      aws_ami: "ami-0a313d6098716f372"
+  vars_files:
+      - variables.yml
+  tasks:
+      - name: Provision servers for varnish
+        ec2:
+            instance_type: "{{ varnish_instance_type }}"
+            termination_protection: "{{ aws_termination_protection }}"
+            image: "{{ aws_ami }}"
+            keypair: "{{ lookup('env','AWS_KEY_PAIR') }}"
+            instance_profile_name: "ManagedSystem"
+            region: "{{ chronam_aws_region }}"
+            zone: "{{ chronam_aws_zone }}"
+            wait: True
+            group: "{{ varnish_security_group }}"
+            vpc_subnet_id: "{{ aws_vpc_subnet_id }}"
+            exact_count: 1
+            count_tag:
+                Name: "Chronam Varnish"
+                Environment: "{{ env }}"
+                Project: "chronam"
+                DeploymentCluster: "{{ deployment_cluster }}"
+            instance_tags:
+                Name: "Chronam Varnish"
+                Environment: "{{ env }}"
+                Project: "chronam"
+                DeploymentCluster: "{{ deployment_cluster }}"
+                Service: Varnish
+            volumes:
+                - device_name: "/dev/sda1"
+                  volume_type: "{{ ec2_storage_type }}"
+                  volume_size: "{{ ec2_filesystem_size }}"
+                  delete_on_termination: True
+            user_data: |
+                #!/bin/sh
+                # Ensure that /usr/bin/python exists for Ansible:
+                apt update -qy && apt-get install -qy python-minimal
+        register: varnish_ec2
+
+      - name: create separate volume for varnish cache
+        ec2_vol:
+            region: "{{ chronam_aws_region }}"
+            device_name: /dev/xvdf
+            instance: "{{ item.id }}"
+            volume_size: "{{ varnish_cache_size }}"
+            volume_type: "{{ ec2_cache_storage_type }}"
+            delete_on_termination: yes
+            tags:
+                Name: "Chronam Varnish Cache"
+                Environment: "{{ env }}"
+                Project: "chronam"
+                DeploymentCluster: "{{ deployment_cluster }}"
+                Service: Varnish
+        with_items: "{{ varnish_ec2.instances }}"
+
+      - name: Wait for ssh to come up
+        wait_for:
+            host: "{{ item.public_dns_name }}"
+            delay: 60
+            timeout: 600
+            port: 22
+            state: started
+        with_items: "{{ varnish_ec2.instances }}"
+
+      - name: Ensure that SSH host keys are registered before we attempt to connect
+        delegate_to: localhost
+        shell: ssh-keyscan {{ item.public_ip }} {{ item.public_dns_name }} >> ~/.ssh/known_hosts
+        with_items: "{{ varnish_ec2.instances }}"
+
+      - name: Register the Varnish server with the load-balancer target group
+        elb_target:
+            target_group_name: "chronam-{{ env_short_name }}-{{ deployment_cluster }}"
+            target_id: "{{ item.id }}"
+            state: present
+        with_items: "{{ varnish_ec2.instances }}"
+
+- name: Update EC2 Inventory
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+      - variables.yml
+  tasks:
+      - name: Retrieve Varnish servers from EC2 Inventory
+        ec2_instance_facts:
+            filters:
+                "instance-state-name": "running"
+                "tag:Name": "Chronam Varnish"
+                "tag:Environment": "{{ env }}"
+                "tag:DeploymentCluster": "{{ deployment_cluster }}"
+                "tag:Project": chronam
+        register: ec2_varnish_inventory
+
+      - name: Add host to Varnish group
+        add_host:
+            hostname: "{{ item.public_dns_name }}"
+            groupname: varnish_instances
+        with_items: "{{ ec2_varnish_inventory.instances }}"
+
+      - name: Add host to project group
+        add_host:
+            hostname: "{{ item.public_dns_name }}"
+            groupname: tag_Project_chronam
+        with_items: "{{ ec2_varnish_inventory.instances }}"
+
+      - name: Add new instance to deployment cluster group
+        add_host:
+            hostname: "{{ item.public_dns_name }}"
+            groupname: "tag_DeploymentCluster_{{ deployment_cluster }}"
+        with_items: "{{ ec2_varnish_inventory.instances }}"
+
+      - name: Retrieve web servers from EC2 Inventory
+        ec2_instance_facts:
+            filters:
+                "instance-state-name": "running"
+                "tag:Name": "Chronam Web App"
+                "tag:Environment": "{{ env }}"
+                "tag:DeploymentCluster": "{{ deployment_cluster }}"
+                "tag:Project": chronam
+        register: ec2_web_app_inventory
+
+      - name: Updating django_private_instances group
+        add_host:
+            hostname: "{{ item.private_ip_address }}"
+            groupname: django_private_instances
+        with_items: "{{ ec2_web_app_inventory.instances }}"
+
+- name: Configure Varnish servers
+  hosts: "varnish_instances:&tag_DeploymentCluster_{{ deployment_cluster }}"
+  user: ubuntu
+  become: yes
+  gather_facts: yes
+  vars_files:
+      - variables.yml
+  pre_tasks:
+      - name: Wait for the cloud-init process to complete
+        wait_for:
+            path: /var/lib/cloud/instance/boot-finished
+            state: present
+
+      - name: Wait for any possibly running unattended upgrade to finish
+        raw: systemd-run --property="After=apt-daily.service apt-daily-upgrade.service" --wait /bin/true
+
+      - name: Install Varnish package
+        apt:
+            update_cache: yes
+            cache_valid_time: 86400
+            name: varnish
+
+      - name: format ebs volume to ext4
+        filesystem:
+            dev: /dev/xvdf
+            fstype: ext4
+
+      - name: remove all reserved blocks from varnish cache partition
+        command: tune2fs -m 0 /dev/xvdf
+
+      - name: mount /var/lib/varnish/ as separate parition
+        mount:
+            name: /var/lib/varnish
+            src: /dev/xvdf
+            fstype: ext4
+            state: mounted
+
+      - name: re-gather facts since we now have a new mount
+        setup: ~
+
+      - name: calculate the varnish cache size
+        set_fact:
+            # convert partition size from bytes to GB and truncate result. We use less
+            # than the full partition size to avoid lengthy garbage-collection events
+            # and significant RAM usage indexing the cache:
+            cache_size: "{{ ((0.4 * item.size_total) / (1024 * 1024 * 1024)) | int }}"
+        when: item.device == "/dev/xvdf"
+        with_items: "{{ ansible_mounts }}"
+
+  tasks:
+      - name: Add server role and environment to bash prompt
+        lineinfile:
+            create: True
+            line: 'export PS1="[ChronAm Varnish {{ env }} {{ deployment_cluster }} ($(lsb_release --description --short))] $PS1"'
+            path: "/home/ubuntu/.bashrc"
+            mode: 0644
+
+      - name: "install Ubuntu user's authorized_keys file"
+        copy:
+            dest: /home/ubuntu/.ssh/authorized_keys
+            src: files/ubuntu-authorized-keys
+            mode: 0700
+
+      - name: install prometheus varnish exporter
+        copy:
+            dest: /usr/bin/prometheus_varnish_exporter
+            src: files/prometheus_varnish_exporter
+            mode: 0755
+
+      - name: install systemd varnish exporter service
+        copy:
+            dest: /etc/systemd/system/prometheus_varnish_exporter.service
+            src: files/prometheus_varnish_exporter.service
+
+      - name: enable varnish exporter service
+        systemd:
+            daemon_reload: yes
+            enabled: yes
+            name: prometheus_varnish_exporter
+            state: started
+
+      - file:
+            dest: /etc/systemd/system/varnish.service.d/
+            state: directory
+            owner: root
+            group: root
+            mode: 0644
+
+      - name: Configure Varnish parameters
+        template:
+            src: templates/varnish.override.conf.j2
+            dest: /etc/systemd/system/varnish.service.d/override.conf
+            owner: root
+            group: root
+            mode: 0644
+
+      - name: Install ChronAm VCL
+        template:
+            src: templates/chronam.vcl.j2
+            dest: /etc/varnish/chronam.vcl
+            owner: root
+            group: root
+            mode: 0644
+
+      - name: restart Varnish
+        systemd:
+            daemon_reload: yes
+            enabled: yes
+            name: varnish
+            state: restarted

@@ -1,0 +1,14 @@
+[Unit]
+Description=Prometheus Apache Exporter
+After=syslog.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/apache_exporter -scrape_uri http://localhost/chronam-status?auto
+Restart=on-failure
+RestartSec=10s
+User=ndnp
+Group=ndnp
+
+[Install]
+WantedBy=multi-user.target

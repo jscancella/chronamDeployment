@@ -1,0 +1,20 @@
+[Unit]
+Description=Jetty 9
+After=syslog.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/solr
+# The JVM GC-related flags are copied from https://github.com/apache/lucene-solr/blob/releases/lucene-solr/4.10.4/solr/bin/solr.in.sh#L28-L42
+# which has been tested against the same release of Solr
+#
+# -XX:+ExitOnOutOfMemoryError is set to allow Solr to cleanly exit rather than
+# accepting requests which will never be completed.
+ExecStart=/usr/bin/java -server -Xmx6g -Xmx12g -XX:+ExitOnOutOfMemoryError -XX:NewRatio=3 -XX:SurvivorRatio=4 -XX:TargetSurvivorRatio=90 -XX:MaxTenuringThreshold=8 -XX:ConcGCThreads=4 -XX:ParallelGCThreads=4 -XX:+CMSScavengeBeforeRemark -XX:PretenureSizeThreshold=64m -XX:+UseCMSInitiatingOccupancyOnly -XX:CMSInitiatingOccupancyFraction=50 -XX:CMSMaxAbortablePrecleanTime=6000 -XX:+CMSParallelRemarkEnabled -XX:+ParallelRefProcEnabled -Djava.io.tmpdir=/var/cache/jetty9/data -Djava.library.path=/usr/lib -Djetty.home=/opt/solr -Djetty.logs=/var/log/jetty9 -Djetty.state=/var/lib/jetty9/jetty.state -Djetty.host=0.0.0.0 -Djetty.port=8080 -jar /opt/solr/start.jar
+Restart=on-failure
+RestartSec=10s
+User=solr
+Group=solr
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+plugin: aws_ec2
+regions:
+    - us-east-1
+filters:
+    instance-state-name: running
+    tag:Project: chronam
+    tag:Environment: Production
+hostnames:
+    - dns-name
+strict: true
+keyed_groups:
+    - prefix: tag
+      key: tags
+    - key: 'security_groups|json_query("[].group_id")'
+      prefix: "security_groups"
+    - key: tags.Name
+      separator: ""
+    - prefix: instance_type
+      key: instance_type

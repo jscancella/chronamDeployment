@@ -1,0 +1,326 @@
+#used to setup the VPCs and all the security groups
+- hosts: localhost
+  vars_files:
+      - variables.yml
+  vars:
+      ec2_subnet_ids: []
+  tasks:
+      - fail:
+            msg: "The Ansible variable 'env' must be one of dev, test, stage, or prod"
+        when:
+            - env != "dev"
+            - env != "test"
+            - env != "stage"
+            - env != "prod"
+
+      - name: create {{ env }} VPC
+        ec2_vpc_net:
+            region: "{{ chronam_aws_region }}"
+            cidr_block: 172.31.0.0/16
+            name: "chronam-{{ env }}-vpc"
+            tags:
+                Project: "chronam"
+        register: chronam_vpc
+
+      - name: create {{ env }} internet gateway
+        ec2_vpc_igw:
+            tags:
+                Name: "chronam-{{ env }}-vpc"
+                Project: "chronam"
+            region: "{{ chronam_aws_region }}"
+            vpc_id: "{{ chronam_vpc.vpc.id }}"
+
+      - name: create ec2 {{ env }} subnets
+        ec2_vpc_subnet:
+            region: "{{ chronam_aws_region }}"
+            az: "{{ item.zone }}"
+            cidr: "{{ item.block }}"
+            map_public: True
+            vpc_id: "{{ chronam_vpc.vpc.id }}"
+            tags:
+                Name: "chronam-{{ env }}-{{ item.zone }}"
+                Project: "chronam"
+        loop:
+            - { zone: "us-east-1a", block: "172.31.16.0/20" }
+            - { zone: "us-east-1b", block: "172.31.32.0/20" }
+            - { zone: "us-east-1c", block: "172.31.48.0/20" }
+            - { zone: "us-east-1d", block: "172.31.64.0/20" }
+            - { zone: "us-east-1e", block: "172.31.80.0/20" }
+            - { zone: "us-east-1f", block: "172.31.96.0/20" }
+        register: subnets_result
+
+      - name: create list of ec2 subnet ids
+        set_fact:
+            ec2_subnet_ids: "{{ ec2_subnet_ids }} + [ '{{ item.subnet.id }}' ]"
+        loop: "{{ subnets_result.results }}"
+
+      - name: create rds {{ env }} subnet
+        rds_subnet_group:
+            region: "{{ chronam_aws_region }}"
+            name: "chronam-{{ env }}-vpc"
+            state: present
+            subnets: "{{ ec2_subnet_ids }}"
+            description: "chronam database vpc for {{ env }}"
+
+      # Since the security groups reference each other, we first have to create them, and then modify the rules using the registered ansible variables
+      - name: create {{ env }} load balancer security group
+        ec2_group:
+            region: "{{ chronam_aws_region }}"
+            tags:
+                Name: "chronam-public-load-balancers-security-group-{{ env }}"
+                Project: "chronam"
+            description: "load balancer for chronam {{ env }}"
+            #Name here is actually the "group name"
+            name: "chronam-public-load-balancers-security-group-{{ env }}"
+            vpc_id: "{{ chronam_vpc.vpc.id }}"
+        register: load_balancer_security_group
+
+      - name: create {{ env }} index security group
+        ec2_group:
+            region: "{{ chronam_aws_region }}"
+            tags:
+                Name: "chronam-index-security-group-{{ env }}"
+                Project: "chronam"
+            description: "chronam solr {{ env }}"
+            #Name here is actually the "group name"
+            name: "chronam-index-security-group-{{ env }}"
+            vpc_id: "{{ chronam_vpc.vpc.id }}"
+        register: index_security_group
+
+      - name: create {{ env }} web application security group
+        ec2_group:
+            region: "{{ chronam_aws_region }}"
+            tags:
+                Name: "chronam-web-application-security-group-{{ env }}"
+                Project: "chronam"
+            description: "chronam django {{ env }}"
+            #Name here is actually the "group name"
+            name: "chronam-web-application-security-group-{{ env }}"
+            vpc_id: "{{ chronam_vpc.vpc.id }}"
+        register: web_application_security_group
+
+      - name: create {{ env }} database security group
+        ec2_group:
+            region: "{{ chronam_aws_region }}"
+            tags:
+                Name: "chronam-database-security-group-{{ env }}"
+                Project: "chronam"
+            description: "chronam mysql {{ env }}"
+            #Name here is actually the "group name"
+            name: "chronam-database-security-group-{{ env }}"
+            vpc_id: "{{ chronam_vpc.vpc.id }}"
+        register: database_security_group
+
+      - name: create {{ env }} cache security group
+        ec2_group:
+            region: "{{ chronam_aws_region }}"
+            tags:
+                Name: "chronam-cache-security-group-{{ env }}"
+                Project: "chronam"
+            description: "chronam varnish {{ env }}"
+            #Name here is actually the "group name"
+            name: "chronam-cache-security-group-{{ env }}"
+            vpc_id: "{{ chronam_vpc.vpc.id }}"
+        register: cache_security_group
+
+      #modify the rules of each of the security groups above! Since they cross reference each other we had to create them first
+      - name: modify {{ env }} database security group
+        ec2_group:
+            name: "{{ database_security_group.group_name }}"
+            description: "{{ database_security_group.description }}"
+            #inbound
+            rules:
+                - proto: tcp
+                  ports:
+                      - 3306
+                  group_id: "{{ web_application_security_group.group_id }}"
+                  rule_desc: chronam web apps
+
+      - name: modify {{ env }} cache security group
+        ec2_group:
+            name: "{{ cache_security_group.group_name }}"
+            description: "{{ cache_security_group.description }}"
+            #inbound
+            rules:
+                - proto: tcp
+                  ports:
+                      - 80
+                      - 22
+                  cidr_ip: 140.147.0.0/16
+                  rule_desc: All LoC computers
+                - proto: tcp
+                  ports:
+                      - 80
+                  group_id: "{{ load_balancer_security_group.group_id }}"
+                  rule_desc: chronam load balancers
+            #outbound
+            rules_egress:
+                - proto: tcp
+                  ports:
+                      - 80
+                  cidr_ip: 140.147.0.0/16
+                  rule_desc: All LoC computers
+                - proto: tcp
+                  ports:
+                      - 80
+                  cidr_ip:
+                      - 0.0.0.0/0
+                  rule_desc: connect to internet
+                - proto: tcp
+                  ports:
+                      - 80
+                  group_id: "{{ load_balancer_security_group.group_id }}"
+                  rule_desc: chronam load balancers
+                - proto: tcp
+                  ports:
+                      - 443
+                  cidr_ip:
+                      - 0.0.0.0/0
+                  rule_desc: packagecloud.io
+
+      - name: modify {{ env }} web application security group
+        ec2_group:
+            name: "{{ web_application_security_group.group_name }}"
+            description: "{{ web_application_security_group.description }}"
+            #inbound
+            rules:
+                - proto: tcp
+                  ports:
+                      - 80
+                      - 22
+                  cidr_ip: 140.147.0.0/16
+                  rule_desc: All LoC computers
+                - proto: tcp
+                  ports:
+                      - 80
+                  group_id: "{{ cache_security_group.group_id }}"
+                  rule_desc: chronam cache
+                - proto: tcp
+                  ports:
+                      - 80
+                  group_id: "{{ web_application_security_group.group_id }}"
+                  rule_desc: chronam web applications
+            #outbound
+            rules_egress:
+                - proto: tcp
+                  ports:
+                      - 80
+                  cidr_ip:
+                      - 0.0.0.0/0
+                  rule_desc: connect to internet
+                - proto: tcp
+                  ports:
+                      - 3306
+                  group_id: "{{ database_security_group.group_id }}"
+                  rule_desc: chronam database
+                - proto: tcp
+                  ports:
+                      - 80
+                  group_id: "{{ cache_security_group.group_id }}"
+                  rule_desc: chronam cache
+                - proto: tcp
+                  ports:
+                      - 8080
+                  group_id: "{{ index_security_group.group_id }}"
+                  rule_desc: chronam solr
+                - proto: tcp
+                  ports:
+                      - 443
+                  cidr_ip:
+                      - 0.0.0.0/0
+                  rule_desc: github
+
+      - name: modify {{ env }} index security group
+        ec2_group:
+            name: "{{ index_security_group.group_name }}"
+            description: "{{ index_security_group.description }}"
+            #inbound
+            rules:
+                - proto: tcp
+                  ports:
+                      - 80
+                      - 22
+                  cidr_ip: 140.147.0.0/16
+                  rule_desc: All LoC computers
+                - proto: tcp
+                  ports:
+                      - 8080
+                  group_id: "{{ web_application_security_group.group_id }}"
+                  rule_desc: chronam web apps
+            #outbound
+            rules_egress:
+                - proto: tcp
+                  ports:
+                      - 80
+                  cidr_ip:
+                      - 0.0.0.0/0
+                  rule_desc: connect to internet
+                - proto: tcp
+                  ports:
+                      - 443
+                  cidr_ip:
+                      - 0.0.0.0/0
+                  rule_desc: github
+
+      - name: modify {{ env }} load balancer security group
+        ec2_group:
+            name: "{{ load_balancer_security_group.group_name }}"
+            description: "{{ load_balancer_security_group.description }}"
+            #inbound
+            rules:
+                - proto: tcp
+                  ports:
+                      - 80
+                  cidr_ip: 140.147.0.0/16
+                  rule_desc: All LoC computers
+                - proto: tcp
+                  ports:
+                      - 443
+                  cidr_ip: 140.147.0.0/16
+                  rule_desc: All LoC computers
+            #outbound
+            rules_egress:
+                - proto: tcp
+                  ports:
+                      - 80
+                  group_id: "{{ cache_security_group.group_id }}"
+                  rule_desc: chronam cache
+
+      - name: create {{ env }} load balancer target group
+        elb_target_group:
+            modify_targets: no
+            region: "{{ chronam_aws_region }}"
+            name: "chronam-{{ env }}-{{ item }}"
+            vpc_id: "{{ chronam_vpc.vpc.id }}"
+            state: present
+            protocol: http
+            port: 80
+            health_check_port: traffic-port
+            health_check_path: /healthz
+            health_check_protocol: http
+            health_check_interval: 15
+            health_check_timeout: 5
+            healthy_threshold_count: 5
+            unhealthy_threshold_count: 5
+            successful_response_codes: 200
+        loop:
+            - blue
+            - green
+
+      - name: create {{ env }} load balancer
+        elb_application_lb:
+            region: "{{ chronam_aws_region }}"
+            name: "chronam-load-balancer-{{ env }}"
+            subnets: "{{ ec2_subnet_ids }}"
+            security_groups:
+                - "{{ load_balancer_security_group.group_id }}"
+            scheme: "internet-facing"
+            listeners:
+                - Protocol: HTTP
+                  Port: 80
+                  DefaultActions:
+                      - Type: forward
+                        TargetGroupName: "chronam-{{ env }}-green"
+            state: present
+            tags:
+                Project: chronam

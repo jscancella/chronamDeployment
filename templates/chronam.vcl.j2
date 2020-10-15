@@ -1,0 +1,162 @@
+vcl 4.0;
+
+import directors;
+
+{% for ip in groups['django_private_instances'] %}
+backend app{{ loop.index }} {
+    .host = "{{ ip }}";
+    .connect_timeout = 5s;
+    .first_byte_timeout = 120s;
+    .between_bytes_timeout = 120s;
+    .probe = {
+        .url = "/healthz";
+        .timeout = 2s;
+        .interval = 30s;
+        .window = 6;
+        .threshold = 3;
+    }
+}
+{% endfor %}
+
+# create a virtual group for use when we do the load balancing
+sub vcl_init {
+    new app = directors.shard();
+    app.set_rampup(15s);
+{% for ip in groups['django_private_instances'] %}
+    app.add_backend(app{{ loop.index }});
+{% endfor %}
+    app.reconfigure();
+}
+
+sub vcl_backend_response {
+    if (((beresp.status == 503) || (beresp.status == 503)) && bereq.retries < 4) {
+        return (retry);
+    }
+
+    set beresp.grace = 1h;
+
+    if (beresp.http.content-type ~ "(text|xml|json)") {
+        set beresp.do_gzip = true;
+    }
+
+    // Unset the Server header because we have lifetime passes to the security theater:
+    unset beresp.http.server;
+    unset beresp.http.x-amz-id-2;
+    unset beresp.http.x-amz-meta-md5;
+    unset beresp.http.x-amz-request-id;
+}
+
+sub vcl_recv {
+    if (req.http.CF-Connecting-IP) {
+        set req.http.X-Forwarded-For = req.http.CF-Connecting-IP;
+    } else {
+        set req.http.X-Forwarded-For = req.http.X-ACE-Forwarded-For;
+    }
+
+    set req.backend_hint = app.backend(KEY, app.key(req.http.X-Forwarded-For), alt=req.restarts);
+
+    # varnish's default configuration won't cache requests with cookies since
+    # that's commonly used for login systems which alter the page contents – see
+    # https://www.varnish-cache.org/docs/trunk/users-guide/increasing-your-hitrate.html#cookies
+    if (req.http.cookie) {
+        unset req.http.cookie;
+    }
+
+    if (req.url ~ ".*[.](zip|gz|bz2|jp2|pdf)$") {
+        # Avoid wasting CPU time compressing content which is already compressed:
+        unset req.http.Accept-Encoding;
+    }
+
+    if (client.ip != "127.0.0.1") {
+        # redirect http to https
+        if (req.http.X-Forwarded-Proto == "http" && req.http.host ~ "chroniclingamerica[^.]*.loc.gov") {
+            set req.http.x-redir = "https://chroniclingamerica.loc.gov" + req.url;
+            return(synth(850, ""));
+        }
+
+        # redirect chroniclingamerica.com vanity site to chroniclingamerica.loc.gov
+        if (req.http.host ~ "chroniclingamerica.com") {
+               set req.http.x-redir = "https://chroniclingamerica.loc.gov" + req.url;
+            return(synth(850, ""));
+        }
+
+        # redirect chroniclingamerica.org vanity site to chroniclingamerica.loc.gov
+        if (req.http.host ~ "chroniclingamerica.org") {
+               set req.http.x-redir = "https://chroniclingamerica.loc.gov" + req.url;
+            return(synth(850, ""));
+        }
+    }
+
+    # Don't cache the large data files – TTFB is less of a concern with non-interactive files
+    # and we have more of them than we have cache size:
+    if (req.url ~ "^/data/") {
+        return (pass);
+    }
+
+    if (req.restarts == 0) {
+        if (req.http.Accept-Encoding ~ "gzip") {
+            # Normalize this to avoid caching multiple compressed objects:
+            set req.http.Accept-Encoding = "gzip";
+        } else {
+            unset req.http.Accept-Encoding;
+        }
+    }
+}
+
+sub vcl_synth {
+    if (resp.status == 850) {
+        set resp.http.Location = req.http.x-redir;
+        set resp.status = 301;
+        return (deliver);
+    }
+}
+
+# Prefer a fresh object, but when one cannot be found Varnish will look for
+# stale one. This replaces req.grace in vcl_recv()
+sub vcl_hit {
+    if (obj.ttl >= 0s) {
+       return (deliver);
+    }
+    if (obj.ttl + obj.grace > 0s) {
+        return (deliver);
+    }
+    return (miss);
+}
+
+# Preserve any Vary headers from the backend but ensure that Vary always
+# includes Accept-Encoding since we enable gzip transfer encoding
+sub vcl_deliver {
+    if (req.url !~ ".*[.](zip|gz|bz2|jp2|pdf)$") {
+        if (!resp.http.Vary) {
+            set resp.http.Vary = "Accept-Encoding";
+        } else if (resp.http.Vary !~ "(?i)Accept-Encoding") {
+            set resp.http.Vary = "Accept-Encoding," + resp.http.Vary;
+        }
+    }
+
+    if (resp.status >= 500 && resp.status <= 599) {
+        set resp.http.Cache-Control = "max-age=10, s-maxage=60";
+    }
+}
+
+# TODO: use a standard LC error page or have CloudFlare substitute one for a
+# backend 5xx error:
+sub vcl_backend_error {
+    set beresp.http.Content-Type = "text/html; charset=utf-8";
+    set beresp.http.Cache-Control = "max-age=10, s-maxage=60";
+    set beresp.http.Retry-After = "5";
+    synthetic ({"
+<!DOCTYPE html>
+    <html>
+        <head>
+            <title>The page is temporarily unavailable</title>
+        </head>
+    <body>
+         <h1>Chronicling America is currently unavailable</h1>
+             <p>The Chronicling America website is currently offline, undergoing maintenance.  We regret the inconvenience, and invite you to visit other collections available on the Library of Congress website at <a href="http://www.loc.gov">www.loc.gov</a> while we are working to restore service.</p>
+    </body>
+</html>
+"});
+
+    return (deliver);
+}

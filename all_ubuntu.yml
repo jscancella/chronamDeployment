@@ -1,0 +1,176 @@
+- name: core Ubuntu configuration
+  become: yes
+  hosts: "tag_Project_chronam:&tag_DeploymentCluster_{{ deployment_cluster }}"
+  vars_files:
+      - vault.yml
+  tasks:
+      - name: Upgrade all packages to the latest version
+        apt:
+            name: "*"
+            state: latest
+            update_cache: yes
+            cache_valid_time: 86400
+            force_apt_get: yes
+            autoremove: yes
+            autoclean: yes
+
+      - name: Install AWS-optimized Linux kernel
+        apt:
+            name: "{{ packages }}"
+        vars:
+            packages:
+                - linux-aws
+                - linux-tools-aws
+                - linux-headers-aws
+
+      - name: Ensure that legacy Linux kernels are not installed
+        apt:
+            name: "{{ packages }}"
+            state: absent
+        vars:
+            packages:
+                - linux-image-virtual
+                - linux-virtual
+
+      - name: Install monitoring tools
+        apt:
+            name: "{{ packages }}"
+        vars:
+            packages:
+                - iotop
+                - sysstat
+
+      - name: Install Prometheus node exporter
+        copy:
+            dest: /usr/local/bin/prometheus_node_exporter
+            src: files/prometheus_node_exporter
+            mode: 0755
+
+      - name: Create Prometheus group
+        group:
+            name: prometheus
+            system: yes
+
+      - name: Create Prometheus user
+        user:
+            name: prometheus
+            comment: Prometheus monitoring user
+            system: yes
+            shell: /bin/false
+            groups: prometheus
+
+      - name: install Prometheus Apache exporter systemd unit
+        copy:
+            dest: /etc/systemd/system/prometheus_node_exporter.service
+            src: files/prometheus_node_exporter.service
+            mode: 0644
+
+      - name: Ensure that Prometheus Node Exporter service is restarted
+        systemd:
+            daemon_reload: yes
+            enabled: yes
+            name: prometheus_node_exporter
+            state: restarted
+
+      - name: syslog to LC DevOps server
+        copy:
+            dest: /etc/rsyslog.d/30-lc-devops-syslog.conf
+            src: files/rsyslog.conf
+            mode: 0644
+
+      - name: Install postfix for mail delivery
+        apt:
+            name: postfix
+
+      - name: Configure Postfix TLS
+        shell: postconf -e 'smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt'
+
+      - name: Configure Postfix for SES
+        shell: postconf -e "relayhost = [email-smtp.us-east-1.amazonaws.com]:587" "smtp_sasl_auth_enable = yes" "smtp_sasl_security_options = noanonymous" "smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd" "smtp_use_tls = yes" "smtp_tls_security_level = encrypt" "smtp_tls_note_starttls_offer = yes"
+
+      - name: Configure Postfix for ChronAm
+        shell: postconf -e "myhostname = chroniclingamerica.loc.gov" "myorigin = loc.gov" "mydomain = loc.gov"
+
+      - name: Configure Postfix address rewriting
+        shell: postconf -e "smtp_generic_maps = regexp:/etc/postfix/smtp_generic_map" "recipient_canonical_maps = regexp:/etc/postfix/recipient_canonical"
+
+      - name: Configure Postfix only to listen on localhost (CIS)
+        shell: postconf -e "inet_interfaces = localhost"
+
+      - name: Configure Postfix SASL authentication
+        template:
+            src: "templates/postfix-sasl_passwd.j2"
+            dest: "/etc/postfix/sasl_passwd"
+            owner: postfix
+            group: postfix
+            mode: 0600
+
+      - name: Install Postfix SMTP generic map
+        lineinfile:
+            create: yes
+            line: "/.*/ devops-alerts@loc.gov"
+            path: "/etc/postfix/smtp_generic_map"
+            mode: 0644
+
+      - name: Install Postfix canonical recipient map
+        lineinfile:
+            create: yes
+            line: "/.*/ devops-alerts@loc.gov"
+            path: "/etc/postfix/recipient_canonical"
+            mode: 0644
+
+      - name: Run postmap
+        shell: postmap -o /etc/postfix/smtp_generic_map /etc/postfix/recipient_canonical /etc/postfix/sasl_passwd
+
+      - name: Set permissions on Postfix SASL database
+        file:
+            path: /etc/postfix/sasl_passwd.db
+            owner: postfix
+            group: postfix
+            mode: 0600
+
+      - name: Restart Postfix
+        systemd:
+            name: postfix
+            state: restarted
+
+      - name: Install AWS Systems Manager Agent
+        # TODO: use the snap module when Ansible 2.8 ships: https://docs.ansible.com/ansible/devel/modules/snap_module.html#snap-module
+        command: snap install amazon-ssm-agent --classic
+
+      - name: Restarting AWS Systems Manager Agent
+        systemd:
+            name: snap.amazon-ssm-agent.amazon-ssm-agent.service
+            state: restarted
+
+      - name: Install mount_status_monitor
+        apt:
+            deb: https://github.com/acdha/mountstatus/releases/download/v2.1.0/mount-status-monitor_2.1.0_amd64.deb
+
+      - name: Restart mount_status_monitor
+        systemd:
+            daemon_reload: yes
+            enabled: yes
+            name: mount_status_monitor
+            state: restarted
+
+      - name: Checking for the Qualys Cloud Agent
+        stat: path=/etc/qualys/cloud-agent
+        register: cloud_agent_stat
+
+      - name: Install Qualys Cloud Agent
+        block:
+            - name: Copying the qualys-cloud-agent .deb
+              copy:
+                  dest: /tmp/qualys-cloud-agent.x86_64.deb
+                  src: files/qualys-cloud-agent.x86_64.deb
+                  mode: 0644
+
+            - name: Installing the qualys-cloud-agent .deb
+              apt:
+                  deb: /tmp/qualys-cloud-agent.x86_64.deb
+
+            - name: Activating the Qualys agent
+              # TODO: get group-specific activation keys and store them in variables
+              command: /usr/local/qualys/cloud-agent/bin/qualys-cloud-agent.sh ActivationId=b028d3e4-f705-4fa0-ad23-e506100fbeff CustomerId=a643fea9-1dd2-6992-8308-2ee864017d84
+        when: not cloud_agent_stat.stat.exists
